@@ -1,0 +1,63 @@
+#!/bin/sh
+set -e
+
+[ -d /dev/net ] ||
+    mkdir -p /dev/net
+[ -c /dev/net/tun ] ||
+    mknod /dev/net/tun c 10 200
+
+cd /etc/openvpn
+[ -f dh.pem ] ||
+    openssl dhparam -out dh.pem 512
+[ -f ca_pk.pem ] ||
+    openssl genrsa -out ca_pk.pem 2048
+chmod 600 ca_pk.pem
+[ -f ca_csr.pem ] ||
+    openssl req -new -key ca_pk.pem -out ca_csr.pem -subj /CN=DockVPN_CA/
+[ -f ca.pem ] ||
+    openssl x509 -req -in ca_csr.pem -out ca.pem -signkey ca_pk.pem -days 36525
+[ -f ca.srl ] ||
+    echo 01 > ca.srl
+
+[ -f server_pk.pem ] ||
+    openssl genrsa -out server_pk.pem 2048
+chmod 600 server_pk.pem
+[ -f server_csr.pem ] ||
+    openssl req -new -key server_pk.pem -out server_csr.pem -subj /CN=OpenVPN_Server/
+[ -f server.pem ] ||
+    openssl x509 -req -in server_csr.pem -out server.pem -CA ca.pem -CAkey ca_pk.pem -days 36525
+
+[ -f tcp${LOCAL_PORT}.conf ] || cat >tcp${LOCAL_PORT}.conf <<EOF
+server 192.168.255.0 255.255.255.128
+verb 3
+ca ca.pem
+cert server.pem
+key server_pk.pem
+dh dh.pem
+keepalive 10 60
+persist-key
+persist-tun
+
+proto tcp-server
+port ${LOCAL_PORT}
+dev tun${LOCAL_PORT}
+push "dhcp-option DNS 117.121.26.98"
+push "dhcp-option DNS 8.8.8.8"
+status openvpn-status-${LOCAL_PORT}.log
+EOF
+
+[ "$LOCAL_IP" ] || {
+    LOCAL_IP=$(curl -s http://myip.enix.org/REMOTE_ADDR)
+    echo "Discovered IP $LOCAL_IP - set LOCAL_IP env variable to override."
+}
+[ "$LOCAL_IP" ] || {
+    echo "Sorry, I could not figure out my public IP address."
+    echo "(I use http://myip.enix.org/REMOTE_ADDR/ for that purpose.)"
+    exit 1
+}
+
+iptables -t nat -A POSTROUTING -s 192.168.255.0/24 -o eth0 -j MASQUERADE
+
+touch tcp${LOCAL_PORT}.log
+while true ; do openvpn tcp${LOCAL_PORT}.conf ; done >> tcp${LOCAL_PORT}.log &
+tail -F *.log
